@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "embedding-provider"
+version = "0.1.0"
+description = "Standalone OpenAI-compatible embedding provider"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "transformers>=4.57.0",
+  "peft>=0.15.2",
+  "numpy>=1.26.0",
+]
+
+[tool.setuptools]
+packages = ["provider"]

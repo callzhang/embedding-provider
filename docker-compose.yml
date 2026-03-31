@@ -1,0 +1,22 @@
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    gpus: all
+    shm_size: ${SHM_SIZE:-2g}
+    ports:
+      - "${BIND_HOST}:${PORT}:8000"
+    environment:
+      SERVICE_NAME: ${SERVICE_NAME}
+      MODEL_ID: ${MODEL_ID}
+      MODEL_ALIAS: ${MODEL_ALIAS:-}
+      EMBEDDING_TASK: ${EMBEDDING_TASK}
+      DEFAULT_DIMENSIONS: ${DEFAULT_DIMENSIONS}
+      MAX_LENGTH: ${MAX_LENGTH}
+      NORMALIZE_EMBEDDINGS: ${NORMALIZE_EMBEDDINGS}
+      DTYPE: ${DTYPE}
+      ATTN_IMPLEMENTATION: ${ATTN_IMPLEMENTATION}
+      TRUST_REMOTE_CODE: ${TRUST_REMOTE_CODE}
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-}
+    volumes:
+      - ${HF_CACHE_DIR:-./data/hf}:/root/.cache/huggingface
