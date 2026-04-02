@@ -23,6 +23,7 @@ class Settings:
     service_name: str
     model_id: str
     model_alias: str | None
+    api_key: str | None
     embedding_task: str | None
     default_dimensions: int | None
     max_length: int | None
@@ -38,6 +39,7 @@ class Settings:
             service_name=os.getenv("SERVICE_NAME", "embedding-provider"),
             model_id=os.getenv("MODEL_ID", "jinaai/jina-embeddings-v5-text-nano"),
             model_alias=os.getenv("MODEL_ALIAS") or None,
+            api_key=os.getenv("API_KEY") or None,
             embedding_task=os.getenv("EMBEDDING_TASK") or None,
             default_dimensions=_env_int("DEFAULT_DIMENSIONS", "768"),
             max_length=_env_int("MAX_LENGTH", "8192"),

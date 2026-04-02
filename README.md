@@ -1,6 +1,6 @@
 # Embedding Provider
 
-Standalone OpenAI-compatible embedding service for Stardust internal use.
+Standalone OpenAI-compatible embedding service for Stardust shared use.
 
 ## Purpose
 
@@ -47,6 +47,7 @@ uvicorn provider.app:app --host 127.0.0.1 --port 8000
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/embeddings \
+  -H "Authorization: Bearer change-me" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "jinaai/jina-embeddings-v5-text-nano",
@@ -60,6 +61,7 @@ curl -X POST http://127.0.0.1:8000/v1/embeddings \
 - Default bind: Tailscale IP on the host, one port per instance
 - Keep `memory-connector` pointing at the chosen provider instance through `GRAPHITI_EMBEDDER_BASE_URL`
 - On the current `gpu4` host, the recommended path is the host-venv scripts under `scripts/`, because Docker GPU runtime is not configured.
+- For public exposure, bind the model server to `127.0.0.1`, enforce `API_KEY`, and publish HTTPS through either a direct reverse proxy or the bundled Cloudflare quick tunnel helper.
 
 ## Remote Sync
 
@@ -76,6 +78,22 @@ ssh stardust-gpu4-stardust
 cd ~/Projects/embedding-provider
 ./scripts/start_host_instance.sh deployments/gpu4/jina-v5-nano.env
 ```
+
+To expose that instance on the public internet with HTTPS on a NATed host like `gpu4`:
+
+```bash
+./scripts/start_public_cloudflared.sh deployments/gpu4/jina-v5-nano.env
+```
+
+Set these values in `deployments/gpu4/jina-v5-nano.env` before starting the public tunnel:
+
+```bash
+BIND_HOST=127.0.0.1
+API_KEY=change-me
+PUBLIC_UPSTREAM=127.0.0.1:7997
+```
+
+If you have a directly routable public IP and want a fixed hostname with automatic TLS, the repo also includes `./scripts/start_public_caddy.sh` plus `deployments/gpu4/public.Caddyfile`.
 
 The host scripts will auto-create `deployments/.../*.env` from the matching
 `.env.example` on first run. To inspect or stop one instance:

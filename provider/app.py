@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from transformers import AutoModel
 
@@ -199,6 +199,14 @@ def _validate_inputs(value: str | list[str]) -> list[str]:
     return texts
 
 
+def _require_api_key(settings: Settings, authorization: str | None) -> None:
+    if not settings.api_key:
+        return
+    expected = f"Bearer {settings.api_key}"
+    if authorization != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
+
+
 def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None = None) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     resolved_runtime = runtime or EmbedderRuntime(resolved_settings)
@@ -217,11 +225,16 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
         }
 
     @app.get("/v1/models", response_model=ModelList)
-    def list_models() -> ModelList:
+    def list_models(authorization: str | None = Header(default=None)) -> ModelList:
+        _require_api_key(resolved_settings, authorization)
         return ModelList(data=[ModelInfo(id=resolved_settings.model_alias or resolved_settings.model_id)])
 
     @app.post("/v1/embeddings", response_model=EmbeddingResponse)
-    def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
+    def create_embeddings(
+        request: EmbeddingRequest,
+        authorization: str | None = Header(default=None),
+    ) -> EmbeddingResponse:
+        _require_api_key(resolved_settings, authorization)
         if request.encoding_format not in (None, "float"):
             raise HTTPException(status_code=400, detail="Only float encoding_format is supported")
         allowed_models = {resolved_settings.model_id}
