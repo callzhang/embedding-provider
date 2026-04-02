@@ -58,10 +58,20 @@ curl -X POST http://127.0.0.1:8000/v1/embeddings \
 ## Stardust GPU4
 
 - Repo target: `stardust@stardust-gpu4:~/Projects/embedding-provider`
-- Default bind: Tailscale IP on the host, one port per instance
+- Private bind: prefer `127.0.0.1` on the host, one port per instance
 - Keep `memory-connector` pointing at the chosen provider instance through `GRAPHITI_EMBEDDER_BASE_URL`
 - On the current `gpu4` host, the recommended path is the host-venv scripts under `scripts/`, because Docker GPU runtime is not configured.
-- For public exposure, bind the model server to `127.0.0.1`, enforce `API_KEY`, and publish HTTPS through either a direct reverse proxy or the bundled Cloudflare quick tunnel helper.
+- For public exposure, bind the model server to `127.0.0.1`, enforce `API_KEY`, and publish HTTPS through a Cloudflare named tunnel.
+
+## Current Production Endpoint
+
+- Public base URL: `https://embed.preseen.ai/v1`
+- Current model: `jinaai/jina-embeddings-v5-text-nano`
+- Current service bind on `gpu4`: `127.0.0.1:7997`
+- Provider defaults:
+  - `MAX_LENGTH=8192`
+  - `MAX_BATCH_SIZE=8`
+  - `DEFAULT_DIMENSIONS=768`
 
 ## Remote Sync
 
@@ -79,13 +89,13 @@ cd ~/Projects/embedding-provider
 ./scripts/start_host_instance.sh deployments/gpu4/jina-v5-nano.env
 ```
 
-To expose that instance on the public internet with HTTPS on a NATed host like `gpu4`:
+To expose that instance on the public internet with a fixed hostname on a NATed host like `gpu4`:
 
 ```bash
 ./scripts/start_public_cloudflared.sh deployments/gpu4/jina-v5-nano.env
 ```
 
-Set these values in `deployments/gpu4/jina-v5-nano.env` before starting the public tunnel:
+Set these values in `deployments/gpu4/jina-v5-nano.env` before starting the tunnel:
 
 ```bash
 BIND_HOST=127.0.0.1
@@ -93,7 +103,35 @@ API_KEY=change-me
 PUBLIC_UPSTREAM=127.0.0.1:7997
 ```
 
-If you have a directly routable public IP and want a fixed hostname with automatic TLS, the repo also includes `./scripts/start_public_caddy.sh` plus `deployments/gpu4/public.Caddyfile`.
+Create the named tunnel and DNS route from a machine already logged into Cloudflare:
+
+```bash
+cloudflared tunnel create embedding-provider-preseen-ai
+cloudflared tunnel route dns embedding-provider-preseen-ai embed.preseen.ai
+cloudflared tunnel token embedding-provider-preseen-ai
+```
+
+Run the token on `gpu4`:
+
+```bash
+docker rm -f embedding-provider-cloudflared >/dev/null 2>&1 || true
+docker run -d \
+  --name embedding-provider-cloudflared \
+  --restart unless-stopped \
+  --network host \
+  cloudflare/cloudflared:latest \
+  tunnel --no-autoupdate run --token <TOKEN> --url http://127.0.0.1:7997
+```
+
+Operational checks:
+
+```bash
+curl https://embed.preseen.ai/healthz
+curl -H "Authorization: Bearer <API_KEY>" https://embed.preseen.ai/v1/models
+docker logs --tail 50 embedding-provider-cloudflared
+```
+
+If you have a directly routable public IP and want a host-local reverse proxy instead of Cloudflare Tunnel, the repo also includes `./scripts/start_public_caddy.sh` plus `deployments/gpu4/public.Caddyfile`.
 
 The host scripts will auto-create `deployments/.../*.env` from the matching
 `.env.example` on first run. To inspect or stop one instance:
