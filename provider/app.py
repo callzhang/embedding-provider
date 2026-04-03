@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import functools
 import inspect
 import logging
 import math
 import time
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
@@ -73,6 +78,8 @@ class EmbedderRuntime:
         self.device_name = str(self._device)
         self._model = self._load_model()
         self._encode_signature = inspect.signature(self._model.encode)
+        self._bytes_per_text_ema: float | None = None
+        self._ema_alpha = 0.25
 
     def _resolve_dtype(self) -> torch.dtype:
         mapping = {
@@ -116,10 +123,30 @@ class EmbedderRuntime:
         if self._settings.max_length and "max_length" in self._encode_signature.parameters:
             kwargs["max_length"] = self._settings.max_length
 
+        track_mem = torch.cuda.is_available()
+        if track_mem:
+            torch.cuda.reset_peak_memory_stats()
+            mem_before = torch.cuda.memory_allocated()
+
         start = time.perf_counter()
-        outputs = self._model.encode(**{input_name: texts}, **kwargs)
+        with torch.no_grad():
+            outputs = self._model.encode(**{input_name: texts}, **kwargs)
         elapsed_ms = (time.perf_counter() - start) * 1000
-        log.info("model=%s texts=%s elapsed_ms=%.1f", self._settings.model_id, len(texts), elapsed_ms)
+
+        if track_mem:
+            delta = torch.cuda.max_memory_allocated() - mem_before
+            if delta > 0:
+                sample = delta / len(texts)
+                if self._bytes_per_text_ema is None:
+                    self._bytes_per_text_ema = sample
+                else:
+                    self._bytes_per_text_ema = self._ema_alpha * sample + (1 - self._ema_alpha) * self._bytes_per_text_ema
+
+        log.info(
+            "model=%s texts=%s elapsed_ms=%.1f bytes_per_text=%.0f",
+            self._settings.model_id, len(texts), elapsed_ms,
+            self._bytes_per_text_ema or 0,
+        )
 
         array = _outputs_to_numpy(outputs)
         if array.ndim == 1:
@@ -169,6 +196,131 @@ class EmbedderRuntime:
             embeddings.extend(self._encode_with_backoff(chunk, dimensions=dimensions, task=task))
         return embeddings
 
+    def estimate_max_texts(self) -> int:
+        """Return a safe upper bound on texts for the next forward pass based on free VRAM."""
+        hard_cap = self._settings.max_batch_size
+        if not torch.cuda.is_available():
+            return hard_cap or 256
+
+        free, total = torch.cuda.mem_get_info()
+        # Reserve 512 MB + 5% of total as headroom for CUDA context, cuBLAS workspace, etc.
+        safety = int(512 * 1024 * 1024) + int(total * 0.05)
+        usable = max(0, free - safety)
+
+        if self._bytes_per_text_ema is None or self._bytes_per_text_ema <= 0:
+            # No measurements yet — conservative default until EMA warms up.
+            estimate = 32
+        else:
+            estimate = max(1, int(usable / self._bytes_per_text_ema))
+
+        if hard_cap:
+            estimate = min(estimate, hard_cap)
+        return max(1, estimate)
+
+
+@dataclass
+class _PendingItem:
+    texts: list[str]
+    dimensions: int | None
+    task: str | None
+    future: asyncio.Future  # resolved with list[list[float]]
+
+
+class ContinuousBatcher:
+    """Collects requests within a time window and dispatches them as a single batch.
+
+    The worker loop is sequential: it collects a window of requests, runs one
+    GPU forward pass (per task/dimensions group), resolves all futures, then
+    starts the next window. This keeps GPU jobs serialized while requests queue
+    up naturally during inference.
+    """
+
+    def __init__(self, runtime: EmbedderRuntime, window_secs: float) -> None:
+        self._runtime = runtime
+        self._window = window_secs
+        self._queue: asyncio.Queue[_PendingItem] = asyncio.Queue()
+
+    def start(self) -> asyncio.Task:
+        return asyncio.create_task(self._worker())
+
+    async def encode(
+        self,
+        texts: list[str],
+        *,
+        dimensions: int | None = None,
+        task: str | None = None,
+    ) -> list[list[float]]:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[list[list[float]]] = loop.create_future()
+        await self._queue.put(_PendingItem(texts=texts, dimensions=dimensions, task=task, future=future))
+        return await future
+
+    async def _worker(self) -> None:
+        loop = asyncio.get_running_loop()
+        pending: list[_PendingItem] = []
+        while True:
+            if not pending:
+                # Block until at least one request arrives.
+                pending.append(await self._queue.get())
+
+                # Drain for the remaining window.
+                deadline = loop.time() + self._window
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                        pending.append(item)
+                    except (asyncio.TimeoutError, TimeoutError):
+                        break
+
+            # Dispatch; overflow (texts that didn't fit in VRAM) is returned
+            # and processed immediately in the next iteration without a new window wait.
+            pending = await self._dispatch(pending, loop)
+
+    async def _dispatch(self, batch: list[_PendingItem], loop: asyncio.AbstractEventLoop) -> list[_PendingItem]:
+        # Group by (task, dimensions) — in practice almost always one group.
+        groups: dict[tuple, list[_PendingItem]] = defaultdict(list)
+        for item in batch:
+            groups[(item.task, item.dimensions)].append(item)
+
+        overflow: list[_PendingItem] = []
+
+        for (task, dimensions), items in groups.items():
+            # Cap this group by available VRAM; overflow is deferred to next iteration.
+            max_texts = self._runtime.estimate_max_texts()
+            to_process: list[_PendingItem] = []
+            text_count = 0
+            for item in items:
+                if to_process and text_count + len(item.texts) > max_texts:
+                    overflow.append(item)
+                else:
+                    to_process.append(item)
+                    text_count += len(item.texts)
+
+            all_texts: list[str] = []
+            offsets: list[int] = []
+            for item in to_process:
+                offsets.append(len(all_texts))
+                all_texts.extend(item.texts)
+
+            log.info(
+                "batch dispatch: requests=%d texts=%d overflow=%d task=%s dim=%s",
+                len(to_process), text_count, len(items) - len(to_process), task, dimensions,
+            )
+            fn = functools.partial(self._runtime.encode, all_texts, dimensions=dimensions, task=task)
+            try:
+                embeddings: list[list[float]] = await loop.run_in_executor(None, fn)
+                for item, offset in zip(to_process, offsets):
+                    item.future.set_result(embeddings[offset: offset + len(item.texts)])
+            except Exception as exc:
+                for item in to_process:
+                    if not item.future.done():
+                        item.future.set_exception(exc)
+
+        return overflow
+
 
 def _outputs_to_numpy(outputs: Any) -> np.ndarray:
     if isinstance(outputs, torch.Tensor):
@@ -210,7 +362,19 @@ def _require_api_key(settings: Settings, authorization: str | None) -> None:
 def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None = None) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     resolved_runtime = runtime or EmbedderRuntime(resolved_settings)
-    app = FastAPI(title="Embedding Provider", version="0.2.0")
+    batcher = ContinuousBatcher(resolved_runtime, window_secs=resolved_settings.batch_window_ms / 1000)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        task = batcher.start()
+        yield
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    app = FastAPI(title="Embedding Provider", version="0.2.0", lifespan=lifespan)
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
@@ -222,6 +386,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "task": resolved_settings.embedding_task,
             "dimensions": resolved_settings.default_dimensions,
             "device": resolved_runtime.device_name,
+            "batch_window_ms": resolved_settings.batch_window_ms,
         }
 
     @app.get("/v1/models", response_model=ModelList)
@@ -230,7 +395,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
         return ModelList(data=[ModelInfo(id=resolved_settings.model_alias or resolved_settings.model_id)])
 
     @app.post("/v1/embeddings", response_model=EmbeddingResponse)
-    def create_embeddings(
+    async def create_embeddings(
         request: EmbeddingRequest,
         authorization: str | None = Header(default=None),
     ) -> EmbeddingResponse:
@@ -247,7 +412,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             )
         texts = _validate_inputs(request.input)
         try:
-            embeddings = resolved_runtime.encode(
+            embeddings = await batcher.encode(
                 texts,
                 dimensions=request.dimensions,
                 task=request.task,

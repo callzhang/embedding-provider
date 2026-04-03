@@ -32,6 +32,7 @@ class Settings:
     dtype: str
     attn_implementation: str | None
     trust_remote_code: bool
+    batch_window_ms: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -48,4 +49,5 @@ class Settings:
             dtype=os.getenv("DTYPE", "bfloat16"),
             attn_implementation=os.getenv("ATTN_IMPLEMENTATION") or None,
             trust_remote_code=_env_bool("TRUST_REMOTE_CODE", True),
+            batch_window_ms=_env_int("BATCH_WINDOW_MS", "200") or 200,
         )
