@@ -147,8 +147,8 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
 
         with (
             patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory),
-            patch("provider.app.torch.cuda.is_available", return_value=True),
-            patch("provider.app.torch.cuda.mem_get_info", return_value=(8 * 1024**3, 24 * 1024**3)),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
         ):
             runtime = EmbedderRuntime(Settings.from_env())
             self.assertEqual(runtime.runtime_status()["loaded_device"], "none")

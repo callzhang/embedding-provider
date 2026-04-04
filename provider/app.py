@@ -19,10 +19,8 @@ import threading
 from typing import Any, Literal
 
 import numpy as np
-import torch
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from transformers import AutoModel
 
 from provider.config import Settings
 
@@ -37,7 +35,52 @@ def _batched(values: list[str], batch_size: int) -> list[list[str]]:
 
 
 def _is_cuda_oom(exc: Exception) -> bool:
-    return isinstance(exc, torch.OutOfMemoryError) or "CUDA out of memory" in str(exc)
+    text = str(exc)
+    return "CUDA out of memory" in text or "OutOfMemoryError" in text
+
+
+def _resolve_gpu_index() -> str | None:
+    visible = os.getenv("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return None
+    first = visible.split(",", 1)[0].strip()
+    if first.isdigit():
+        return first
+    return None
+
+
+def _probe_cuda_memory_bytes() -> tuple[int | None, int | None]:
+    command = [
+        "nvidia-smi",
+        "--query-gpu=memory.free,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+    gpu_index = _resolve_gpu_index()
+    if gpu_index is not None:
+        command.insert(1, f"--id={gpu_index}")
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return None, None
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None, None
+    try:
+        free_raw, total_raw = [part.strip() for part in lines[0].split(",", 1)]
+        return int(free_raw) * 1024 * 1024, int(total_raw) * 1024 * 1024
+    except Exception:
+        return None, None
+
+
+def _detect_preferred_device() -> str:
+    free_bytes, _total_bytes = _probe_cuda_memory_bytes()
+    return "cuda" if free_bytes is not None else "cpu"
 
 
 class EmbeddingRequest(BaseModel):
@@ -184,11 +227,11 @@ class _GpuEmbedderWorker:
 class EmbedderRuntime:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._preferred_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._preferred_device = _detect_preferred_device()
         self._device = self._preferred_device
-        self.device_name = "none" if str(self._preferred_device) == "cuda" else str(self._device)
+        self.device_name = "none" if self._preferred_device == "cuda" else self._device
         self._model_lock = threading.Condition()
-        self._use_gpu_worker = str(self._preferred_device) == "cuda"
+        self._use_gpu_worker = self._preferred_device == "cuda"
         self._gpu_worker: _GpuEmbedderWorker | None = _GpuEmbedderWorker(settings) if self._use_gpu_worker else None
         self._model = None if self._use_gpu_worker else self._load_model()
         self._encode_signature = None if self._model is None else inspect.signature(self._model.encode)
@@ -201,7 +244,9 @@ class EmbedderRuntime:
         self._last_offloaded_at: float | None = None
         self._idle_offload_enabled = self._use_gpu_worker and settings.idle_offload_seconds > 0
 
-    def _resolve_dtype(self) -> torch.dtype:
+    def _resolve_dtype(self) -> Any:
+        import torch
+
         mapping = {
             "float16": torch.float16,
             "fp16": torch.float16,
@@ -212,7 +257,10 @@ class EmbedderRuntime:
         }
         return mapping.get(self._settings.dtype.lower(), torch.bfloat16)
 
-    def _load_model(self, device_override: torch.device | None = None) -> Any:
+    def _load_model(self, device_override: str | None = None) -> Any:
+        import torch
+        from transformers import AutoModel
+
         target_device = device_override or self._preferred_device
         kwargs: dict[str, Any] = {
             "trust_remote_code": self._settings.trust_remote_code,
@@ -240,7 +288,7 @@ class EmbedderRuntime:
                 offloaded_for = max(0.0, time.monotonic() - self._last_offloaded_at)
             return {
                 "loaded_device": self.device_name,
-                "preferred_device": str(self._preferred_device),
+                "preferred_device": self._preferred_device,
                 "engine_state": self._engine_state,
                 "idle_offload_enabled": self._idle_offload_enabled,
                 "idle_offload_seconds": self._settings.idle_offload_seconds if self._idle_offload_enabled else None,
@@ -273,13 +321,13 @@ class EmbedderRuntime:
                 if self._gpu_worker is not None:
                     self._gpu_worker.terminate()
                 with self._model_lock:
-                    self._device = torch.device("cpu")
+                    self._device = "cpu"
                     self.device_name = "none"
                     self._engine_state = "offloaded"
                     self._last_offloaded_at = time.monotonic()
             else:
-                next_model = self._load_model(device_override=torch.device("cpu"))
-                self._swap_model(next_model, torch.device("cpu"), engine_state="offloaded")
+                next_model = self._load_model(device_override="cpu")
+                self._swap_model(next_model, "cpu", engine_state="offloaded")
             return True
         finally:
             with self._model_lock:
@@ -301,7 +349,7 @@ class EmbedderRuntime:
                     raise RuntimeError("embedding GPU worker is unavailable")
                 device_name = self._gpu_worker.ensure_started()
                 with self._model_lock:
-                    self._device = torch.device(device_name)
+                    self._device = device_name
                     self.device_name = device_name
                     self._engine_state = "hot"
                     self._last_offloaded_at = None
@@ -329,7 +377,7 @@ class EmbedderRuntime:
             self._last_encode_finished_at = time.monotonic()
             self._model_lock.notify_all()
 
-    def _swap_model(self, next_model: Any, next_device: torch.device, *, engine_state: str) -> None:
+    def _swap_model(self, next_model: Any, next_device: str, *, engine_state: str) -> None:
         if self._use_gpu_worker:
             raise RuntimeError("_swap_model is unavailable in GPU worker mode")
         with self._model_lock:
@@ -346,7 +394,9 @@ class EmbedderRuntime:
         if old_model is not next_model:
             del old_model
             gc.collect()
-            if torch.cuda.is_available():
+            if self._preferred_device == "cuda":
+                import torch
+
                 torch.cuda.empty_cache()
 
     def _encode_once(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
@@ -355,7 +405,7 @@ class EmbedderRuntime:
                 raise RuntimeError("embedding GPU worker is unavailable")
             device_name = self._gpu_worker.ensure_started()
             with self._model_lock:
-                self._device = torch.device(device_name)
+                self._device = device_name
                 self.device_name = device_name
                 self._engine_state = "hot"
                 self._last_offloaded_at = None
@@ -379,7 +429,9 @@ class EmbedderRuntime:
         if self._settings.max_length and "max_length" in self._encode_signature.parameters:
             kwargs["max_length"] = self._settings.max_length
 
-        track_mem = torch.cuda.is_available()
+        import torch
+
+        track_mem = self._preferred_device == "cuda"
         if track_mem:
             torch.cuda.reset_peak_memory_stats()
             mem_before = torch.cuda.memory_allocated()
@@ -429,7 +481,9 @@ class EmbedderRuntime:
         except RuntimeError as exc:
             if not _is_cuda_oom(exc):
                 raise
-            if torch.cuda.is_available():
+            if self._preferred_device == "cuda":
+                import torch
+
                 torch.cuda.empty_cache()
             if len(texts) <= 1:
                 raise ValueError(
@@ -459,10 +513,12 @@ class EmbedderRuntime:
     def estimate_max_texts(self) -> int:
         """Return a safe upper bound on texts for the next forward pass based on free VRAM."""
         hard_cap = self._settings.max_batch_size
-        if not torch.cuda.is_available():
+        if self._preferred_device != "cuda":
             return hard_cap or 256
 
-        free, total = torch.cuda.mem_get_info()
+        free, total = _probe_cuda_memory_bytes()
+        if free is None or total is None:
+            return hard_cap or 256
         # Reserve 512 MB + 5% of total as headroom for CUDA context, cuBLAS workspace, etc.
         safety = int(512 * 1024 * 1024) + int(total * 0.05)
         usable = max(0, free - safety)
@@ -583,6 +639,8 @@ class ContinuousBatcher:
 
 
 def _outputs_to_numpy(outputs: Any) -> np.ndarray:
+    import torch
+
     if isinstance(outputs, torch.Tensor):
         return outputs.detach().float().cpu().numpy()
     if isinstance(outputs, np.ndarray):
