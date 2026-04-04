@@ -4,8 +4,13 @@ import asyncio
 import functools
 import gc
 import inspect
+import json
 import logging
 import math
+import os
+from pathlib import Path
+import subprocess
+import sys
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -73,23 +78,127 @@ class ModelList(BaseModel):
     data: list[ModelInfo]
 
 
+class _GpuEmbedderWorker:
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._root_dir = Path(__file__).resolve().parents[1]
+        self._process: subprocess.Popen[str] | None = None
+        self._io_lock = threading.RLock()
+        self._device_name = "none"
+
+    @property
+    def pid(self) -> int | None:
+        if self._process is None:
+            return None
+        return self._process.pid
+
+    def is_running(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    def ensure_started(self) -> str:
+        with self._io_lock:
+            if self.is_running():
+                return self._device_name
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            self._process = subprocess.Popen(
+                [sys.executable, "-m", "provider.gpu_worker"],
+                cwd=str(self._root_dir),
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            message = self._read_message()
+            if str(message.get("status")) != "ready":
+                self.terminate()
+                raise RuntimeError(str(message.get("error") or "failed to start embedding GPU worker"))
+            self._device_name = str(message.get("device") or "cuda")
+            return self._device_name
+
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        dimensions: int | None = None,
+        task: str | None = None,
+    ) -> tuple[list[list[float]], float | None]:
+        response = self._request(
+            {
+                "op": "encode",
+                "texts": texts,
+                "dimensions": dimensions,
+                "task": task,
+            }
+        )
+        embeddings = [[float(value) for value in row] for row in response.get("embeddings") or []]
+        sample = response.get("sample_bytes_per_text")
+        return embeddings, float(sample) if sample is not None else None
+
+    def terminate(self) -> None:
+        with self._io_lock:
+            process = self._process
+            self._process = None
+            self._device_name = "none"
+            if process is None:
+                return
+            if process.poll() is None:
+                try:
+                    self._write_message({"op": "shutdown"}, process=process)
+                    process.wait(timeout=2)
+                except Exception:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except Exception:
+                        process.kill()
+                        process.wait(timeout=5)
+
+    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._io_lock:
+            self.ensure_started()
+            self._write_message(payload)
+            response = self._read_message()
+        if str(response.get("status")) != "ok":
+            raise RuntimeError(str(response.get("error") or "embedding GPU worker request failed"))
+        return response
+
+    def _write_message(self, payload: dict[str, Any], *, process: subprocess.Popen[str] | None = None) -> None:
+        target = process or self._process
+        if target is None or target.stdin is None:
+            raise RuntimeError("embedding GPU worker stdin is unavailable")
+        target.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        target.stdin.flush()
+
+    def _read_message(self) -> dict[str, Any]:
+        if self._process is None or self._process.stdout is None:
+            raise RuntimeError("embedding GPU worker stdout is unavailable")
+        line = self._process.stdout.readline()
+        if not line:
+            return {"status": "error", "error": "embedding GPU worker exited before responding"}
+        return json.loads(line)
+
+
 class EmbedderRuntime:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._preferred_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._device = self._preferred_device
-        self.device_name = str(self._device)
+        self.device_name = "none" if str(self._preferred_device) == "cuda" else str(self._device)
         self._model_lock = threading.Condition()
-        self._model = self._load_model()
-        self._encode_signature = inspect.signature(self._model.encode)
+        self._use_gpu_worker = str(self._preferred_device) == "cuda"
+        self._gpu_worker: _GpuEmbedderWorker | None = _GpuEmbedderWorker(settings) if self._use_gpu_worker else None
+        self._model = None if self._use_gpu_worker else self._load_model()
+        self._encode_signature = None if self._model is None else inspect.signature(self._model.encode)
         self._bytes_per_text_ema: float | None = None
         self._ema_alpha = 0.25
-        self._engine_state = "hot"
+        self._engine_state = "offloaded" if self._use_gpu_worker else "hot"
         self._reload_in_progress = False
         self._inflight_encodes = 0
         self._last_encode_finished_at = time.monotonic()
         self._last_offloaded_at: float | None = None
-        self._idle_offload_enabled = self.device_name == "cuda" and settings.idle_offload_seconds > 0
+        self._idle_offload_enabled = self._use_gpu_worker and settings.idle_offload_seconds > 0
 
     def _resolve_dtype(self) -> torch.dtype:
         mapping = {
@@ -141,7 +250,12 @@ class EmbedderRuntime:
                 "idle_for_seconds": round(idle_for, 3),
                 "offloaded_for_seconds": round(offloaded_for, 3) if offloaded_for is not None else None,
                 "reload_in_progress": self._reload_in_progress,
+                "worker_pid": self._gpu_worker.pid if self._gpu_worker is not None and self._gpu_worker.is_running() else None,
             }
+
+    def close(self) -> None:
+        if self._gpu_worker is not None:
+            self._gpu_worker.terminate()
 
     def maybe_offload_idle(self) -> bool:
         if not self._idle_offload_enabled:
@@ -154,8 +268,17 @@ class EmbedderRuntime:
                 return False
             self._reload_in_progress = True
         try:
-            next_model = self._load_model(device_override=torch.device("cpu"))
-            self._swap_model(next_model, torch.device("cpu"), engine_state="offloaded")
+            if self._use_gpu_worker:
+                if self._gpu_worker is not None:
+                    self._gpu_worker.terminate()
+                with self._model_lock:
+                    self._device = torch.device("cpu")
+                    self.device_name = "none"
+                    self._engine_state = "offloaded"
+                    self._last_offloaded_at = time.monotonic()
+            else:
+                next_model = self._load_model(device_override=torch.device("cpu"))
+                self._swap_model(next_model, torch.device("cpu"), engine_state="offloaded")
             return True
         finally:
             with self._model_lock:
@@ -172,8 +295,18 @@ class EmbedderRuntime:
                 return
             self._reload_in_progress = True
         try:
-            next_model = self._load_model(device_override=self._preferred_device)
-            self._swap_model(next_model, self._preferred_device, engine_state="hot")
+            if self._use_gpu_worker:
+                if self._gpu_worker is None:
+                    raise RuntimeError("embedding GPU worker is unavailable")
+                device_name = self._gpu_worker.ensure_started()
+                with self._model_lock:
+                    self._device = torch.device(device_name)
+                    self.device_name = device_name
+                    self._engine_state = "hot"
+                    self._last_offloaded_at = None
+            else:
+                next_model = self._load_model(device_override=self._preferred_device)
+                self._swap_model(next_model, self._preferred_device, engine_state="hot")
         finally:
             with self._model_lock:
                 self._reload_in_progress = False
@@ -196,6 +329,8 @@ class EmbedderRuntime:
             self._model_lock.notify_all()
 
     def _swap_model(self, next_model: Any, next_device: torch.device, *, engine_state: str) -> None:
+        if self._use_gpu_worker:
+            raise RuntimeError("_swap_model is unavailable in GPU worker mode")
         with self._model_lock:
             old_model = self._model
             self._model = next_model
@@ -214,7 +349,25 @@ class EmbedderRuntime:
                 torch.cuda.empty_cache()
 
     def _encode_once(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
+        if self._use_gpu_worker:
+            if self._gpu_worker is None:
+                raise RuntimeError("embedding GPU worker is unavailable")
+            device_name = self._gpu_worker.ensure_started()
+            with self._model_lock:
+                self._device = torch.device(device_name)
+                self.device_name = device_name
+                self._engine_state = "hot"
+                self._last_offloaded_at = None
+            embeddings, sample = self._gpu_worker.encode(texts, dimensions=dimensions, task=task)
+            if sample is not None and sample > 0:
+                if self._bytes_per_text_ema is None:
+                    self._bytes_per_text_ema = sample
+                else:
+                    self._bytes_per_text_ema = self._ema_alpha * sample + (1 - self._ema_alpha) * self._bytes_per_text_ema
+            return embeddings
         kwargs: dict[str, Any] = {}
+        if self._encode_signature is None:
+            raise RuntimeError("embedding model signature is unavailable")
         input_name = "texts" if "texts" in self._encode_signature.parameters else "sentences"
         requested_dimensions = dimensions or self._settings.default_dimensions
         effective_task = task or self._settings.embedding_task
@@ -494,6 +647,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
                 await offload_task
             except asyncio.CancelledError:
                 pass
+        resolved_runtime.close()
 
     app = FastAPI(title="Embedding Provider", version="0.2.0", lifespan=lifespan)
 

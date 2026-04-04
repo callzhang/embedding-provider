@@ -83,21 +83,34 @@ from provider.app import EmbedderRuntime
 from provider.config import Settings
 
 
-class FakeModel:
-    def __init__(self, load_device: str) -> None:
-        self.load_device = load_device
-        self.to_device = load_device
+class FakeWorker:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.running = False
+        self.starts = 0
+        self.stops = 0
 
-    def to(self, device) -> "FakeModel":
-        self.to_device = str(device)
-        return self
+    @property
+    def pid(self) -> int | None:
+        return 4321 if self.running else None
 
-    def eval(self) -> "FakeModel":
-        return self
+    def is_running(self) -> bool:
+        return self.running
 
-    def encode(self, texts: list[str], **kwargs) -> np.ndarray:
-        width = kwargs.get("truncate_dim") or 4
-        return np.ones((len(texts), width), dtype=np.float32)
+    def ensure_started(self) -> str:
+        self.running = True
+        self.starts += 1
+        return "cuda"
+
+    def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None):
+        self.ensure_started()
+        width = dimensions or 4
+        return np.ones((len(texts), width), dtype=np.float32).tolist(), 1024.0
+
+    def terminate(self) -> None:
+        if self.running:
+            self.stops += 1
+        self.running = False
 
 
 class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
@@ -125,33 +138,41 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         self._env_stack.close()
 
     def test_idle_runtime_offloads_and_reloads(self) -> None:
-        built_devices: list[str] = []
+        workers: list[FakeWorker] = []
 
-        def fake_from_pretrained(*args, **kwargs):
-            built_devices.append("loaded")
-            return FakeModel(load_device="cpu")
+        def fake_worker_factory(settings: Settings) -> FakeWorker:
+            worker = FakeWorker(settings)
+            workers.append(worker)
+            return worker
 
         with (
-            patch("provider.app.AutoModel.from_pretrained", side_effect=fake_from_pretrained),
+            patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory),
             patch("provider.app.torch.cuda.is_available", return_value=True),
-            patch("provider.app.torch.cuda.empty_cache"),
             patch("provider.app.torch.cuda.mem_get_info", return_value=(8 * 1024**3, 24 * 1024**3)),
         ):
             runtime = EmbedderRuntime(Settings.from_env())
-            self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
-
-            runtime._last_encode_finished_at -= 2
-            offloaded = runtime.maybe_offload_idle()
-            self.assertTrue(offloaded)
-            self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
-            self.assertEqual(runtime.runtime_status()["engine_state"], "offloaded")
+            self.assertEqual(runtime.runtime_status()["loaded_device"], "none")
 
             embeddings = runtime.encode(["hello world"])
             self.assertEqual(len(embeddings), 1)
             self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
             self.assertEqual(runtime.runtime_status()["engine_state"], "hot")
 
-        self.assertEqual(len(built_devices), 3)
+            runtime._last_encode_finished_at -= 2
+            offloaded = runtime.maybe_offload_idle()
+            self.assertTrue(offloaded)
+            self.assertEqual(runtime.runtime_status()["loaded_device"], "none")
+            self.assertEqual(runtime.runtime_status()["engine_state"], "offloaded")
+
+            embeddings = runtime.encode(["hello world"])
+            self.assertEqual(len(embeddings), 1)
+            self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
+            self.assertEqual(runtime.runtime_status()["engine_state"], "hot")
+            runtime.close()
+
+        self.assertEqual(len(workers), 1)
+        self.assertGreaterEqual(workers[0].starts, 1)
+        self.assertGreaterEqual(workers[0].stops, 1)
 
 
 if __name__ == "__main__":

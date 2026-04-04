@@ -76,16 +76,16 @@ curl -X POST http://127.0.0.1:8000/v1/embeddings \
 
 ## Idle GPU Offload
 
-On CUDA hosts, the provider can release model VRAM after a long idle window.
+On CUDA hosts, the provider now keeps the HTTP process alive but moves the loaded model into a dedicated GPU worker subprocess. After a long idle window, that worker exits entirely so VRAM is actually released.
 
-- `IDLE_OFFLOAD_SECONDS`: how long the service may stay idle before the loaded model is swapped to CPU RAM
-- `IDLE_OFFLOAD_POLL_SECONDS`: how often the background monitor checks whether idle offload should run
+- `IDLE_OFFLOAD_SECONDS`: how long the service may stay idle before the GPU worker is terminated
+- `IDLE_OFFLOAD_POLL_SECONDS`: how often the background monitor checks whether idle termination should run
 
 When idle offload is enabled:
 
-- an unused embedding model vacates VRAM after the configured idle threshold
-- the next embedding request automatically reloads the model back onto CUDA before inference
-- `/healthz` exposes a `runtime` block with `loaded_device`, `engine_state`, `idle_for_seconds`, and `reload_in_progress`
+- an unused embedding model vacates VRAM after the configured idle threshold because the GPU worker exits
+- the next embedding request automatically starts a fresh GPU worker before inference
+- `/healthz` exposes a `runtime` block with `loaded_device`, `engine_state`, `idle_for_seconds`, `reload_in_progress`, and `worker_pid`
 
 This only affects the embedding-provider process itself. It does not touch the OCR service, system CUDA, or other GPU workloads on the host.
 
