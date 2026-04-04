@@ -124,12 +124,13 @@ class _GpuEmbedderWorker:
         dimensions: int | None = None,
         task: str | None = None,
     ) -> tuple[list[list[float]], float | None]:
+        effective_task = task or self._settings.embedding_task
         response = self._request(
             {
                 "op": "encode",
                 "texts": texts,
                 "dimensions": dimensions,
-                "task": task,
+                "task": effective_task,
             }
         )
         embeddings = [[float(value) for value in row] for row in response.get("embeddings") or []]

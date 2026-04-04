@@ -93,7 +93,7 @@ def main() -> int:
             continue
         texts = [str(item) for item in request.get("texts") or []]
         dimensions = request.get("dimensions")
-        task = request.get("task")
+        task = request.get("task") or settings.embedding_task
         kwargs: dict[str, Any] = {}
         input_name = "texts" if "texts" in encode_signature.parameters else "sentences"
         if task and "task" in encode_signature.parameters:
