@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import gc
 import inspect
 import logging
 import math
@@ -9,6 +10,7 @@ import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import threading
 from typing import Any, Literal
 
 import numpy as np
@@ -74,12 +76,20 @@ class ModelList(BaseModel):
 class EmbedderRuntime:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._preferred_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._device = self._preferred_device
         self.device_name = str(self._device)
+        self._model_lock = threading.Condition()
         self._model = self._load_model()
         self._encode_signature = inspect.signature(self._model.encode)
         self._bytes_per_text_ema: float | None = None
         self._ema_alpha = 0.25
+        self._engine_state = "hot"
+        self._reload_in_progress = False
+        self._inflight_encodes = 0
+        self._last_encode_finished_at = time.monotonic()
+        self._last_offloaded_at: float | None = None
+        self._idle_offload_enabled = self.device_name == "cuda" and settings.idle_offload_seconds > 0
 
     def _resolve_dtype(self) -> torch.dtype:
         mapping = {
@@ -92,7 +102,8 @@ class EmbedderRuntime:
         }
         return mapping.get(self._settings.dtype.lower(), torch.bfloat16)
 
-    def _load_model(self) -> Any:
+    def _load_model(self, device_override: torch.device | None = None) -> Any:
+        target_device = device_override or self._preferred_device
         kwargs: dict[str, Any] = {
             "trust_remote_code": self._settings.trust_remote_code,
             "torch_dtype": self._resolve_dtype(),
@@ -106,10 +117,101 @@ class EmbedderRuntime:
             kwargs.pop("attn_implementation", None)
             model = AutoModel.from_pretrained(self._settings.model_id, **kwargs)
         if hasattr(model, "to"):
-            model = model.to(self._device)
+            model = model.to(target_device)
         if hasattr(model, "eval"):
             model.eval()
         return model
+
+    def runtime_status(self) -> dict[str, Any]:
+        with self._model_lock:
+            idle_for = max(0.0, time.monotonic() - self._last_encode_finished_at)
+            offloaded_for = None
+            if self._last_offloaded_at is not None:
+                offloaded_for = max(0.0, time.monotonic() - self._last_offloaded_at)
+            return {
+                "loaded_device": self.device_name,
+                "preferred_device": str(self._preferred_device),
+                "engine_state": self._engine_state,
+                "idle_offload_enabled": self._idle_offload_enabled,
+                "idle_offload_seconds": self._settings.idle_offload_seconds if self._idle_offload_enabled else None,
+                "idle_offload_poll_seconds": (
+                    self._settings.idle_offload_poll_seconds if self._idle_offload_enabled else None
+                ),
+                "inflight_encodes": self._inflight_encodes,
+                "idle_for_seconds": round(idle_for, 3),
+                "offloaded_for_seconds": round(offloaded_for, 3) if offloaded_for is not None else None,
+                "reload_in_progress": self._reload_in_progress,
+            }
+
+    def maybe_offload_idle(self) -> bool:
+        if not self._idle_offload_enabled:
+            return False
+        with self._model_lock:
+            if self._reload_in_progress or self._engine_state == "offloaded" or self._inflight_encodes > 0:
+                return False
+            idle_for = time.monotonic() - self._last_encode_finished_at
+            if idle_for < self._settings.idle_offload_seconds:
+                return False
+            self._reload_in_progress = True
+        try:
+            next_model = self._load_model(device_override=torch.device("cpu"))
+            self._swap_model(next_model, torch.device("cpu"), engine_state="offloaded")
+            return True
+        finally:
+            with self._model_lock:
+                self._reload_in_progress = False
+                self._model_lock.notify_all()
+
+    def _ensure_hot_model(self) -> None:
+        if not self._idle_offload_enabled:
+            return
+        with self._model_lock:
+            while self._reload_in_progress:
+                self._model_lock.wait()
+            if self._engine_state == "hot":
+                return
+            self._reload_in_progress = True
+        try:
+            next_model = self._load_model(device_override=self._preferred_device)
+            self._swap_model(next_model, self._preferred_device, engine_state="hot")
+        finally:
+            with self._model_lock:
+                self._reload_in_progress = False
+                self._model_lock.notify_all()
+
+    def _begin_encode(self) -> None:
+        with self._model_lock:
+            self._inflight_encodes += 1
+            self._model_lock.notify_all()
+        try:
+            self._ensure_hot_model()
+        except Exception:
+            self._finish_encode()
+            raise
+
+    def _finish_encode(self) -> None:
+        with self._model_lock:
+            self._inflight_encodes = max(0, self._inflight_encodes - 1)
+            self._last_encode_finished_at = time.monotonic()
+            self._model_lock.notify_all()
+
+    def _swap_model(self, next_model: Any, next_device: torch.device, *, engine_state: str) -> None:
+        with self._model_lock:
+            old_model = self._model
+            self._model = next_model
+            self._encode_signature = inspect.signature(self._model.encode)
+            self._device = next_device
+            self.device_name = str(next_device)
+            self._engine_state = engine_state
+            if engine_state == "offloaded":
+                self._last_offloaded_at = time.monotonic()
+            else:
+                self._last_offloaded_at = None
+        if old_model is not next_model:
+            del old_model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _encode_once(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
         kwargs: dict[str, Any] = {}
@@ -190,11 +292,15 @@ class EmbedderRuntime:
             return [*left, *right]
 
     def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
-        max_batch_size = self._settings.max_batch_size or len(texts)
-        embeddings: list[list[float]] = []
-        for chunk in _batched(texts, max_batch_size):
-            embeddings.extend(self._encode_with_backoff(chunk, dimensions=dimensions, task=task))
-        return embeddings
+        self._begin_encode()
+        try:
+            max_batch_size = self._settings.max_batch_size or len(texts)
+            embeddings: list[list[float]] = []
+            for chunk in _batched(texts, max_batch_size):
+                embeddings.extend(self._encode_with_backoff(chunk, dimensions=dimensions, task=task))
+            return embeddings
+        finally:
+            self._finish_encode()
 
     def estimate_max_texts(self) -> int:
         """Return a safe upper bound on texts for the next forward pass based on free VRAM."""
@@ -367,12 +473,27 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         task = batcher.start()
+        offload_task: asyncio.Task | None = None
+        if resolved_runtime.runtime_status()["idle_offload_enabled"]:
+            async def idle_offload_worker() -> None:
+                while True:
+                    await asyncio.sleep(resolved_settings.idle_offload_poll_seconds)
+                    await asyncio.get_running_loop().run_in_executor(None, resolved_runtime.maybe_offload_idle)
+
+            offload_task = asyncio.create_task(idle_offload_worker())
         yield
         task.cancel()
+        if offload_task is not None:
+            offload_task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+        if offload_task is not None:
+            try:
+                await offload_task
+            except asyncio.CancelledError:
+                pass
 
     app = FastAPI(title="Embedding Provider", version="0.2.0", lifespan=lifespan)
 
@@ -387,6 +508,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "dimensions": resolved_settings.default_dimensions,
             "device": resolved_runtime.device_name,
             "batch_window_ms": resolved_settings.batch_window_ms,
+            "runtime": resolved_runtime.runtime_status(),
         }
 
     @app.get("/v1/models", response_model=ModelList)

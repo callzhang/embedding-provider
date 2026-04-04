@@ -33,6 +33,8 @@ class Settings:
     attn_implementation: str | None
     trust_remote_code: bool
     batch_window_ms: int
+    idle_offload_seconds: float
+    idle_offload_poll_seconds: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -50,4 +52,6 @@ class Settings:
             attn_implementation=os.getenv("ATTN_IMPLEMENTATION") or None,
             trust_remote_code=_env_bool("TRUST_REMOTE_CODE", True),
             batch_window_ms=_env_int("BATCH_WINDOW_MS", "200") or 200,
+            idle_offload_seconds=float(os.getenv("IDLE_OFFLOAD_SECONDS", "1800")),
+            idle_offload_poll_seconds=float(os.getenv("IDLE_OFFLOAD_POLL_SECONDS", "30")),
         )
