@@ -12,14 +12,17 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import threading
 from typing import Any, Literal
+from uuid import uuid4
 
 import numpy as np
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from provider.config import Settings
@@ -81,6 +84,103 @@ def _probe_cuda_memory_bytes() -> tuple[int | None, int | None]:
 def _detect_preferred_device() -> str:
     free_bytes, _total_bytes = _probe_cuda_memory_bytes()
     return "cuda" if free_bytes is not None else "cpu"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _summarize_exception(exc: Exception) -> str:
+    detail = str(exc).strip()
+    if detail:
+        return f"{exc.__class__.__name__}: {detail}"
+    return exc.__class__.__name__
+
+
+class ProviderRuntimeStats:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._requests_total = 0
+        self._requests_succeeded = 0
+        self._requests_failed = 0
+        self._texts_total = 0
+        self._batches_total = 0
+        self._batch_texts_total = 0
+        self._queue_depth = 0
+        self._oldest_queue_age_seconds = 0.0
+        self._reloads_total = 0
+        self._offloads_total = 0
+        self._last_request_at: str | None = None
+        self._last_request_id: str | None = None
+        self._last_success_at: str | None = None
+        self._last_success_request_id: str | None = None
+        self._last_error_at: str | None = None
+        self._last_error_request_id: str | None = None
+        self._last_error_summary: str | None = None
+        self._last_duration_ms: float | None = None
+
+    def record_request_start(self, *, request_id: str, text_count: int) -> None:
+        with self._lock:
+            self._requests_total += 1
+            self._texts_total += text_count
+            self._last_request_at = _utc_now_iso()
+            self._last_request_id = request_id
+
+    def record_request_success(self, *, request_id: str, duration_ms: float) -> None:
+        with self._lock:
+            self._requests_succeeded += 1
+            self._last_success_at = _utc_now_iso()
+            self._last_success_request_id = request_id
+            self._last_duration_ms = round(duration_ms, 3)
+
+    def record_request_failure(self, *, request_id: str, duration_ms: float, error_summary: str) -> None:
+        with self._lock:
+            self._requests_failed += 1
+            self._last_error_at = _utc_now_iso()
+            self._last_error_request_id = request_id
+            self._last_error_summary = error_summary
+            self._last_duration_ms = round(duration_ms, 3)
+
+    def record_batch_dispatch(self, *, request_count: int, text_count: int) -> None:
+        with self._lock:
+            self._batches_total += 1
+            self._batch_texts_total += text_count
+
+    def update_pending(self, *, depth: int, oldest_age_seconds: float | None) -> None:
+        with self._lock:
+            self._queue_depth = max(0, depth)
+            self._oldest_queue_age_seconds = round(max(0.0, oldest_age_seconds or 0.0), 3)
+
+    def record_reload(self) -> None:
+        with self._lock:
+            self._reloads_total += 1
+
+    def record_offload(self) -> None:
+        with self._lock:
+            self._offloads_total += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "requests_total": self._requests_total,
+                "requests_succeeded": self._requests_succeeded,
+                "requests_failed": self._requests_failed,
+                "texts_total": self._texts_total,
+                "batches_total": self._batches_total,
+                "batch_texts_total": self._batch_texts_total,
+                "queue_depth": self._queue_depth,
+                "oldest_queue_age_seconds": self._oldest_queue_age_seconds,
+                "reloads_total": self._reloads_total,
+                "offloads_total": self._offloads_total,
+                "last_request_at": self._last_request_at,
+                "last_request_id": self._last_request_id,
+                "last_success_at": self._last_success_at,
+                "last_success_request_id": self._last_success_request_id,
+                "last_error_at": self._last_error_at,
+                "last_error_request_id": self._last_error_request_id,
+                "last_error_summary": self._last_error_summary,
+                "last_duration_ms": self._last_duration_ms,
+            }
 
 
 class EmbeddingRequest(BaseModel):
@@ -243,6 +343,10 @@ class EmbedderRuntime:
         self._last_encode_finished_at = time.monotonic()
         self._last_offloaded_at: float | None = None
         self._idle_offload_enabled = self._use_gpu_worker and settings.idle_offload_seconds > 0
+        self._stats: ProviderRuntimeStats | None = None
+
+    def attach_stats(self, stats: ProviderRuntimeStats) -> None:
+        self._stats = stats
 
     def _resolve_dtype(self) -> Any:
         import torch
@@ -328,6 +432,8 @@ class EmbedderRuntime:
             else:
                 next_model = self._load_model(device_override="cpu")
                 self._swap_model(next_model, "cpu", engine_state="offloaded")
+            if self._stats is not None:
+                self._stats.record_offload()
             return True
         finally:
             with self._model_lock:
@@ -356,6 +462,8 @@ class EmbedderRuntime:
             else:
                 next_model = self._load_model(device_override=self._preferred_device)
                 self._swap_model(next_model, self._preferred_device, engine_state="hot")
+            if self._stats is not None:
+                self._stats.record_reload()
         finally:
             with self._model_lock:
                 self._reload_in_progress = False
@@ -540,6 +648,8 @@ class _PendingItem:
     dimensions: int | None
     task: str | None
     future: asyncio.Future  # resolved with list[list[float]]
+    enqueued_at: float
+    request_id: str
 
 
 class ContinuousBatcher:
@@ -551,10 +661,29 @@ class ContinuousBatcher:
     up naturally during inference.
     """
 
-    def __init__(self, runtime: EmbedderRuntime, window_secs: float) -> None:
+    def __init__(self, runtime: EmbedderRuntime, stats: ProviderRuntimeStats, window_secs: float) -> None:
         self._runtime = runtime
+        self._stats = stats
         self._window = window_secs
         self._queue: asyncio.Queue[_PendingItem] = asyncio.Queue()
+        self._pending_enqueued_at: deque[float] = deque()
+
+    def _refresh_pending_snapshot(self) -> None:
+        oldest_age = None
+        if self._pending_enqueued_at:
+            oldest_age = time.monotonic() - self._pending_enqueued_at[0]
+        self._stats.update_pending(depth=len(self._pending_enqueued_at), oldest_age_seconds=oldest_age)
+
+    def _mark_enqueued(self, enqueued_at: float) -> None:
+        self._pending_enqueued_at.append(enqueued_at)
+        self._refresh_pending_snapshot()
+
+    def _mark_processed(self, count: int) -> None:
+        for _ in range(max(0, count)):
+            if not self._pending_enqueued_at:
+                break
+            self._pending_enqueued_at.popleft()
+        self._refresh_pending_snapshot()
 
     def start(self) -> asyncio.Task:
         return asyncio.create_task(self._worker())
@@ -565,10 +694,22 @@ class ContinuousBatcher:
         *,
         dimensions: int | None = None,
         task: str | None = None,
+        request_id: str,
     ) -> list[list[float]]:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[list[list[float]]] = loop.create_future()
-        await self._queue.put(_PendingItem(texts=texts, dimensions=dimensions, task=task, future=future))
+        enqueued_at = time.monotonic()
+        await self._queue.put(
+            _PendingItem(
+                texts=texts,
+                dimensions=dimensions,
+                task=task,
+                future=future,
+                enqueued_at=enqueued_at,
+                request_id=request_id,
+            )
+        )
+        self._mark_enqueued(enqueued_at)
         return await future
 
     async def _worker(self) -> None:
@@ -625,6 +766,7 @@ class ContinuousBatcher:
                 "batch dispatch: requests=%d texts=%d overflow=%d task=%s dim=%s",
                 len(to_process), text_count, len(items) - len(to_process), task, dimensions,
             )
+            self._stats.record_batch_dispatch(request_count=len(to_process), text_count=text_count)
             fn = functools.partial(self._runtime.encode, all_texts, dimensions=dimensions, task=task)
             try:
                 embeddings: list[list[float]] = await loop.run_in_executor(None, fn)
@@ -634,6 +776,8 @@ class ContinuousBatcher:
                 for item in to_process:
                     if not item.future.done():
                         item.future.set_exception(exc)
+            finally:
+                self._mark_processed(len(to_process))
 
         return overflow
 
@@ -680,7 +824,9 @@ def _require_api_key(settings: Settings, authorization: str | None) -> None:
 def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None = None) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     resolved_runtime = runtime or EmbedderRuntime(resolved_settings)
-    batcher = ContinuousBatcher(resolved_runtime, window_secs=resolved_settings.batch_window_ms / 1000)
+    stats = ProviderRuntimeStats()
+    resolved_runtime.attach_stats(stats)
+    batcher = ContinuousBatcher(resolved_runtime, stats=stats, window_secs=resolved_settings.batch_window_ms / 1000)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -708,7 +854,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
                 pass
         resolved_runtime.close()
 
-    app = FastAPI(title="Embedding Provider", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Embedding Provider", version="0.3.0", lifespan=lifespan)
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
@@ -722,6 +868,28 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "device": resolved_runtime.device_name,
             "batch_window_ms": resolved_settings.batch_window_ms,
             "runtime": resolved_runtime.runtime_status(),
+            "stats": stats.snapshot(),
+        }
+
+    @app.get("/readyz")
+    def readyz() -> JSONResponse:
+        runtime_status = resolved_runtime.runtime_status()
+        payload = {
+            "ready": not bool(runtime_status.get("reload_in_progress")),
+            "service": resolved_settings.service_name,
+            "model": resolved_settings.model_id,
+            "runtime": runtime_status,
+            "stats": stats.snapshot(),
+        }
+        return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
+
+    @app.get("/statsz")
+    def statsz() -> dict[str, Any]:
+        return {
+            "service": resolved_settings.service_name,
+            "model": resolved_settings.model_id,
+            "stats": stats.snapshot(),
+            "runtime": resolved_runtime.runtime_status(),
         }
 
     @app.get("/v1/models", response_model=ModelList)
@@ -732,11 +900,19 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
     @app.post("/v1/embeddings", response_model=EmbeddingResponse)
     async def create_embeddings(
         request: EmbeddingRequest,
+        response: Response,
         authorization: str | None = Header(default=None),
+        x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
     ) -> EmbeddingResponse:
         _require_api_key(resolved_settings, authorization)
+        request_id = (x_request_id or uuid4().hex).strip()
+        response.headers["X-Request-Id"] = request_id
         if request.encoding_format not in (None, "float"):
-            raise HTTPException(status_code=400, detail="Only float encoding_format is supported")
+            raise HTTPException(
+                status_code=400,
+                detail="Only float encoding_format is supported",
+                headers={"X-Request-Id": request_id},
+            )
         allowed_models = {resolved_settings.model_id}
         if resolved_settings.model_alias:
             allowed_models.add(resolved_settings.model_alias)
@@ -744,16 +920,70 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             raise HTTPException(
                 status_code=400,
                 detail=f"Loaded model is {resolved_settings.model_id}, got {request.model}",
+                headers={"X-Request-Id": request_id},
             )
         texts = _validate_inputs(request.input)
+        stats.record_request_start(request_id=request_id, text_count=len(texts))
+        started_at = time.perf_counter()
+        log.info(
+            "embedding request started request_id=%s texts=%d dimensions=%s task=%s",
+            request_id,
+            len(texts),
+            request.dimensions,
+            request.task,
+        )
         try:
             embeddings = await batcher.encode(
                 texts,
                 dimensions=request.dimensions,
                 task=request.task,
+                request_id=request_id,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            error_summary = _summarize_exception(exc)
+            stats.record_request_failure(
+                request_id=request_id,
+                duration_ms=duration_ms,
+                error_summary=error_summary,
+            )
+            log.warning(
+                "embedding request failed request_id=%s texts=%d duration_ms=%.1f error=%s",
+                request_id,
+                len(texts),
+                duration_ms,
+                error_summary,
+            )
+            raise HTTPException(status_code=400, detail=str(exc), headers={"X-Request-Id": request_id}) from exc
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            error_summary = _summarize_exception(exc)
+            stats.record_request_failure(
+                request_id=request_id,
+                duration_ms=duration_ms,
+                error_summary=error_summary,
+            )
+            log.exception(
+                "embedding request crashed request_id=%s texts=%d duration_ms=%.1f error=%s",
+                request_id,
+                len(texts),
+                duration_ms,
+                error_summary,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="embedding request failed",
+                headers={"X-Request-Id": request_id},
+            ) from exc
+
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        stats.record_request_success(request_id=request_id, duration_ms=duration_ms)
+        log.info(
+            "embedding request succeeded request_id=%s texts=%d duration_ms=%.1f",
+            request_id,
+            len(texts),
+            duration_ms,
+        )
 
         return EmbeddingResponse(
             data=[EmbeddingItem(index=idx, embedding=embedding) for idx, embedding in enumerate(embeddings)],

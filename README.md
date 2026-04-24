@@ -9,6 +9,14 @@ Standalone OpenAI-compatible embedding service for Stardust shared use.
 - Reuse one service codebase for different embedder instances
 - Start multiple isolated provider instances from different env files
 
+## Control Plane Boundary
+
+`embedding-provider` is a model-serving runtime, not a backend control plane.
+
+- Active provider selection lives in `memory-connector` through `config/llm_profiles.json` and `targets.embedder`
+- This service must not store backend graph state, dirty/re-embed state, or active profile overrides
+- This service only owns model loading, batching, health/readiness, and runtime-local offload/reload behavior
+
 ## Runtime Model
 
 The service is a thin OpenAI-compatible wrapper over one loaded embedding model. It does not carry `memory-connector` backend logic. To run multiple embedders, start multiple compose projects with different env files, ports, cache directories, and optional GPU pinning.
@@ -49,10 +57,19 @@ uvicorn provider.app:app --host 127.0.0.1 --port 8000
 curl -X POST http://127.0.0.1:8000/v1/embeddings \
   -H "Authorization: Bearer change-me" \
   -H "Content-Type: application/json" \
+  -H "X-Request-Id: demo-embed-001" \
   -d '{
     "model": "jinaai/jina-embeddings-v5-text-nano",
     "input": ["Alice leads Project Alpha"]
   }'
+```
+
+Observability endpoints:
+
+```bash
+curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:8000/readyz
+curl http://127.0.0.1:8000/statsz
 ```
 
 ## Stardust GPU4
@@ -86,6 +103,8 @@ When idle offload is enabled:
 - an unused embedding model vacates VRAM after the configured idle threshold because the GPU worker exits
 - the next embedding request automatically starts a fresh GPU worker before inference
 - `/healthz` exposes a `runtime` block with `loaded_device`, `engine_state`, `idle_for_seconds`, `reload_in_progress`, and `worker_pid`
+- `/readyz` distinguishes “process is alive” from “service is ready to accept embedding requests”
+- `/statsz` exposes request counters, queue depth, last error summary, and reload/offload counters
 
 This only affects the embedding-provider process itself. It does not touch the OCR service, system CUDA, or other GPU workloads on the host.
 
@@ -143,6 +162,8 @@ Operational checks:
 
 ```bash
 curl https://embed.preseen.ai/healthz
+curl https://embed.preseen.ai/readyz
+curl https://embed.preseen.ai/statsz
 curl -H "Authorization: Bearer <API_KEY>" https://embed.preseen.ai/v1/models
 docker logs --tail 50 embedding-provider-cloudflared
 ```
